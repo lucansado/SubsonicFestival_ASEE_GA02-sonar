@@ -1,0 +1,49 @@
+name: SonarCloud
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Tests y análisis de ms-usuarios
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Instalar dependencias
+        working-directory: ms-usuarios
+        run: python -m pip install -r requirements.txt pytest-cov
+      - name: Ejecutar pruebas y generar cobertura XML
+        working-directory: ms-usuarios
+        run: |
+          coverage_config="$RUNNER_TEMP/ms-usuarios.coveragerc"
+          cat > "$coverage_config" <<'EOF'
+          [run]
+          source = .
+          relative_files = True
+          branch = True
+          omit =
+              tests/*
+              migrations/*
+          EOF
+          python -m pytest -q --cov --cov-config="$coverage_config" --cov-report=term --cov-report=xml:coverage.xml
+      - name: Analizar en SonarQube Cloud
+        uses: SonarSource/sonarqube-scan-action@70bad232163b09d998ea0707ee80c0ec80798c16 # v8
+        with:
+          projectBaseDir: ms-usuarios
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
