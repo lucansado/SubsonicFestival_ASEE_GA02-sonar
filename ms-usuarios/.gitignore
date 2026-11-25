@@ -1,0 +1,13 @@
+.env
+.env.*
+firebase-claves.json
+*firebase*.json
+secrets/
+*.db
+.pytest_cache/
+__pycache__/
+*.py[cod]
+/.coverage
+/.coverage.*
+/coverage.xml
+/.venv/

@@ -1,0 +1,1252 @@
+openapi: 3.0.3
+info:
+  title: Subsonic Festival - ms-usuarios
+  version: 1.0.0
+  description: |
+    Microservicio **Usuarios** de la arquitectura de Subsonic Festival (Grupo GA02).
+    La visión global de la arquitectura está en la Memoria de la Práctica 1 (Practica1_Memoria_ASEE_GA02.pdf).
+
+    ## Responsabilidades
+    - Registro, **perfil** y **rol** de los usuarios. La autenticación (credenciales, login con Google) la hace **Firebase Authentication**; este servicio no guarda contraseñas y asigna el rol como custom claim del token.
+    - Datos de los **proveedores** y activación, desactivación y borrado de cuentas.
+    - **Entradas**: compra (coordinando la reserva de aforo con ms-espacios y el cobro con la pasarela de pago), QR firmado, consulta, cancelación y validación en la puerta.
+    - **Artistas favoritos** de los clientes.
+    - **Notificaciones** push (Firebase Cloud Messaging) y email como reacción a eventos de otros servicios.
+
+    ## Tipos de usuario
+    | Tipo | Identificación | Puede |
+    |---|---|---|
+    | Visitante | Sin cuenta (id anónimo de sesión, solo para analítica) | Consultar eventos, escaleta, artistas y recomendaciones populares. |
+    | Cliente | Cuenta Firebase, rol `CLIENTE` | Comprar y cancelar entradas, marcar favoritos, recibir recomendaciones. |
+    | Proveedor | Cuenta Firebase, rol `PROVEEDOR` | Alquilar espacios (en ms-espacios), ver su historial. |
+    | Administrador | Cuenta Firebase, rol `ADMIN` | Gestionar usuarios, entradas, eventos, espacios y escaleta. |
+    | Staff de acceso | Cuenta Firebase, rol `STAFF` | Validar entradas en la puerta del recinto. |
+
+    ## Reglas de negocio
+    - `me` en una ruta es el usuario autenticado. Los roles `ADMIN` y `STAFF` solo los asigna un administrador.
+    - Nunca se guardan datos de tarjeta: el front-end obtiene un `token_pago` de la pasarela y solo se guarda la referencia del pago.
+    - El **QR** contiene el id de la entrada, el evento y una firma HMAC, de modo que el staff puede verificarlo incluso sin conexión.
+    - Una entrada solo se puede validar una vez (pasa a `USADA`); un segundo intento responde `409`.
+    - Al eliminar una cuenta se borran los datos personales y se publica `usuarios.usuario.eliminado` para que el resto de servicios anonimicen los suyos (RGPD).
+
+    ## Almacenamiento
+    **PostgreSQL** (`usuarios_db`). No se guardan contraseñas (Firebase) ni datos de tarjeta (solo la referencia del pago).
+
+    **usuarios**: perfil común de todos los usuarios registrados
+
+    | Campo | Tipo | Descripción |
+    |---|---|---|
+    | id | VARCHAR(128) (PK) | UID de Firebase. |
+    | email | VARCHAR(255) UNIQUE | Correo electrónico. |
+    | nombre / apellidos | VARCHAR | Nombre completo. |
+    | telefono / direccion | VARCHAR | Datos de contacto. |
+    | rol | VARCHAR(20) | CLIENTE, PROVEEDOR, ADMIN o STAFF. |
+    | activo | BOOLEAN | Cuenta activa o desactivada. |
+    | creado_en | TIMESTAMPTZ | Fecha de registro. |
+
+    **proveedores**: datos adicionales de los proveedores
+
+    | Campo | Tipo | Descripción |
+    |---|---|---|
+    | usuario_id | VARCHAR(128) (PK, FK usuarios) | Usuario proveedor. |
+    | nombre_comercial / cif | VARCHAR | Datos fiscales. |
+    | tipo_servicio | VARCHAR(100) | Comida, bebida, merchandising… |
+    | descripcion_servicio | TEXT | Descripción del servicio que ofrece. |
+    | validado | BOOLEAN | Validado por un administrador. |
+
+    **entradas**: entradas compradas por los clientes
+
+    | Campo | Tipo | Descripción |
+    |---|---|---|
+    | id | VARCHAR(50) (PK) | Identificador legible, p. ej. `entrada-abc12345`. |
+    | usuario_id | VARCHAR(128) (FK usuarios) | Comprador. |
+    | evento_id | VARCHAR(100) | Evento (referencia a ms-espacios). |
+    | evento_titulo / evento_fechas | VARCHAR | Copia de los datos del evento en el momento de la compra (para mostrarlos sin llamar a ms-espacios). |
+    | tipo_pase / precio_pagado | VARCHAR(20) / NUMERIC(8,2) | DAY, WEEKEND o VIP y precio cobrado. |
+    | estado | VARCHAR(30) | ACTIVA, CANCELACION_SOLICITADA, CANCELADA o USADA. |
+    | codigo_qr | VARCHAR(255) | Contenido del QR firmado con HMAC (id de entrada + evento + firma), verificable sin conexión. |
+    | reserva_id / pago_ref | UUID / VARCHAR | Reserva de aforo y referencia de pago asociadas. |
+    | motivo_cancelacion | TEXT | Motivo indicado por el cliente. |
+    | comprada_en / usada_en | TIMESTAMPTZ | Fechas de compra y de validación en puerta. |
+
+    **artistas_favoritos**: artistas marcados por los clientes
+
+    | Campo | Tipo | Descripción |
+    |---|---|---|
+    | usuario_id | VARCHAR(128) (PK, FK usuarios) | Cliente. |
+    | artista_id | UUID (PK) | Artista (referencia a ms-escaleta). |
+    | artista_nombre | VARCHAR(255) | Copia del nombre para mostrarlo sin consultar ms-escaleta. |
+    | creado_en | TIMESTAMPTZ | Fecha en la que se marcó. |
+
+    **preferencias_notificacion**: canales de notificación
+
+    | Campo | Tipo | Descripción |
+    |---|---|---|
+    | usuario_id | VARCHAR(128) (PK, FK usuarios) | Usuario. |
+    | push / email | BOOLEAN | Canales activados. |
+    | fcm_tokens | JSONB | Tokens de Firebase Cloud Messaging de los dispositivos del usuario. |
+
+    **Origen en la versión monolítica actual**: `usuarios` (los campos de proveedor pasan a la tabla `proveedores`; la clave pasa a ser el UID de Firebase), `entradas` (enlazadas por UID y a la reserva de aforo; QR firmado) y `artistas_favoritos` (por `artista_id` en lugar del nombre).
+
+    ## Estados de una entrada
+    ```text
+                (cliente)                         (admin)
+    ACTIVA ---------------> CANCELACION_SOLICITADA ---------> CANCELADA
+      |                              |
+      |                              +--(admin rechaza)--> ACTIVA
+      +--(staff valida en puerta)--> USADA
+    ```
+
+    ## Eventos que publica
+    | Evento | Lo consumen |
+    |---|---|
+    | `usuarios.usuario.registrado` | ms-analitica |
+    | `usuarios.proveedor.actualizado` / `desactivado` | ms-espacios (réplica de proveedores), ms-analitica |
+    | `usuarios.usuario.eliminado` | ms-espacios, ms-tienda, ms-analitica (anonimización) |
+    | `usuarios.entrada.comprada` | ms-espacios (confirma la reserva), ms-analitica |
+    | `usuarios.entrada.cancelada` | ms-espacios (libera cupo), ms-analitica |
+    | `usuarios.entrada.validada` | ms-analitica (asistencia real) |
+    | `usuarios.favorito.anadido` / `eliminado` | ms-analitica |
+
+    ## Eventos que consume (notificaciones)
+    | Evento | Notificación |
+    |---|---|
+    | `escaleta.pase.modificado` / `cancelado` | Push a los clientes con ese artista en favoritos y entrada para el evento. |
+    | `escaleta.publicada` | Push a los clientes con entrada para el evento. |
+    | `espacios.evento.cancelado` | Marca las entradas para reembolso y avisa a los compradores. |
+    | `espacios.alquiler.solicitado` | Aviso a los administradores. |
+    | `espacios.alquiler.aprobado` / `rechazado` | Push y email al proveedor. |
+    | `tienda.pedido.creado` / `actualizado` | Email de confirmación y avisos de envío o recogida. |
+    | `tienda.stock.bajo` | Aviso a los administradores. |
+    | `escaleta.artista.actualizado` | Actualiza el nombre copiado en los favoritos. |
+
+    ## Flujo: compra de una entrada
+    ```text
+         Cliente         Gateway       ms-usuarios     ms-espacios      Pasarela         Broker
+            |               |               |               |               |               |
+            | 1. POST /usuarios/me/entradas |               |               |               |
+            |-------------->|               |               |               |               |
+            |               | 2. JWT ok, rol cliente        |               |               |
+            |               |-------------->|               |               |               |
+            |               |               | 3. POST reservas-aforo        |               |
+            |               |               |-------------->|               |               |
+            |               |               | 4. 201 reserva, precio        |               |
+            |               |               |<--------------|               |               |
+            |               |               | 5. cobro(token_pago)          |               |
+            |               |               |------------------------------>|               |
+            |               |               | 6. pago OK    |               |               |
+            |               |               |<------------------------------|               |
+            |               |               | 7. guarda entrada + QR firmado
+            |               |               | 8. entrada.comprada           |               |
+            |               |               |~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~>|
+            |               |               |               | 9. confirma reserva           |
+            |               |               |               |<~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~|
+            | 10. 201 entrada + QR          |               |               |               |
+            |<------------------------------|               |               |               |
+            |               |               |               |               |               |
+    ```
+    Errores: sin cupo → `409`; pago rechazado → `402` (se libera la reserva);
+    ms-espacios o la pasarela caídos → `503` con `Retry-After`.
+
+    ## Flujo: validación en la puerta
+    ```text
+          Staff          Gateway       ms-usuarios       Broker
+            |               |               |               |
+            | 1. POST /entradas/validaciones|               |
+            |-------------->|               |               |
+            |               | 2. rol = staff|               |
+            |               |-------------->|               |
+            |               |               | 3. firma, evento y estado
+            | 4. 201 acceso / 409           |               |
+            |<------------------------------|               |
+            |               |               | 5. entrada.validada
+            |               |               |~~~~~~~~~~~~~~>|
+            |               |               |               |
+    ```
+
+    `---` llamada síncrona (HTTP) · `~~~` mensaje asíncrono (evento)
+  contact:
+    name: Grupo GA02 - ASEE, Universidad de Extremadura
+servers:
+  - url: https://api.subsonicfestival.com/api/v1
+    description: Producción (a través del API Gateway)
+  - url: http://localhost:8000/api/v1
+    description: Desarrollo local
+tags:
+  - name: Perfil
+    description: Registro y perfil del usuario autenticado
+  - name: Administración de usuarios
+    description: Gestión de usuarios y proveedores (admin)
+  - name: Entradas
+    description: Compra, consulta, cancelación y validación de entradas
+  - name: Favoritos
+    description: Artistas favoritos del cliente
+  - name: Notificaciones
+    description: Preferencias y dispositivos para notificaciones push
+security:
+  - bearerAuth: []
+
+paths:
+  /usuarios:
+    post:
+      tags: [Perfil]
+      summary: Registrar el perfil de un usuario
+      description: |
+        Se llama justo después de crear la cuenta en Firebase, con su token. Crea el perfil,
+        asigna el rol (`cliente` o `proveedor`; los roles `admin` y `staff` solo los asigna un
+        administrador) y publica `usuarios.usuario.registrado`. **Rol:** autenticado.
+      operationId: registrarUsuario
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistroEntrada'
+            example:
+              nombre: Paula
+              apellidos: Jiménez Cruz
+              telefono: '+34 600 000 000'
+              rol: CLIENTE
+      responses:
+        '201':
+          description: Perfil creado
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /api/v1/usuarios/me
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '409':
+          description: El usuario ya tiene perfil
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    get:
+      tags: [Administración de usuarios]
+      summary: Listar usuarios
+      description: '**Rol:** admin.'
+      operationId: listarUsuarios
+      parameters:
+        - name: rol
+          in: query
+          schema:
+            $ref: '#/components/schemas/Rol'
+        - name: activo
+          in: query
+          schema:
+            type: boolean
+        - name: q
+          in: query
+          description: Búsqueda por nombre o email
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Desplazamiento'
+      responses:
+        '200':
+          description: Usuarios
+          headers:
+            X-Total-Count:
+              $ref: '#/components/headers/XTotalCount'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+
+  /usuarios/me:
+    get:
+      tags: [Perfil]
+      summary: Obtener el perfil propio
+      description: Si el usuario es proveedor incluye los datos del servicio. **Rol:** autenticado.
+      operationId: obtenerPerfil
+      responses:
+        '200':
+          description: Perfil
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          description: El usuario todavía no ha registrado su perfil
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    patch:
+      tags: [Perfil]
+      summary: Modificar el perfil propio o desactivar la cuenta
+      description: |
+        Solo se envían los campos que cambian. Enviar `{"activo": false}` desactiva la
+        cuenta. Si es proveedor, publica `usuarios.proveedor.actualizado` o
+        `usuarios.proveedor.desactivado`. **Rol:** autenticado.
+      operationId: modificarPerfil
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PerfilCambio'
+      responses:
+        '200':
+          description: Perfil modificado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+    delete:
+      tags: [Perfil]
+      summary: Eliminar la cuenta
+      description: |
+        Borra los datos personales, elimina la cuenta de Firebase y publica
+        `usuarios.usuario.eliminado` para que el resto de servicios anonimicen sus datos (RGPD).
+        **Rol:** autenticado.
+      operationId: eliminarCuenta
+      responses:
+        '204':
+          description: Cuenta eliminada
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '409':
+          description: Tiene entradas activas de eventos no celebrados; debe cancelarlas antes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /usuarios/{usuario_id}:
+    parameters:
+      - $ref: '#/components/parameters/UsuarioId'
+    get:
+      tags: [Administración de usuarios]
+      summary: Obtener un usuario
+      description: '**Rol:** admin.'
+      operationId: obtenerUsuario
+      responses:
+        '200':
+          description: Usuario
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+    patch:
+      tags: [Administración de usuarios]
+      summary: Cambiar el rol o activar/desactivar un usuario
+      description: Actualiza también el custom claim del token en Firebase. **Rol:** admin.
+      operationId: modificarUsuario
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                rol:
+                  $ref: '#/components/schemas/Rol'
+                activo:
+                  description: false desactiva la cuenta y true la reactiva.
+                  type: boolean
+                  example: false
+      responses:
+        '200':
+          description: Usuario modificado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+
+  /proveedores:
+    get:
+      tags: [Administración de usuarios]
+      summary: Control de proveedores
+      description: '**Rol:** admin.'
+      operationId: listarProveedores
+      parameters:
+        - name: validado
+          in: query
+          schema:
+            type: boolean
+        - name: tipo_servicio
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Desplazamiento'
+      responses:
+        '200':
+          description: Proveedores
+          headers:
+            X-Total-Count:
+              $ref: '#/components/headers/XTotalCount'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+
+  /proveedores/{usuario_id}:
+    parameters:
+      - $ref: '#/components/parameters/UsuarioId'
+    patch:
+      tags: [Administración de usuarios]
+      summary: Validar a un proveedor
+      description: Publica `usuarios.proveedor.actualizado`. **Rol:** admin.
+      operationId: validarProveedor
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [validado]
+              properties:
+                validado:
+                  description: true valida al proveedor (ya puede alquilar espacios) y false le retira la validación.
+                  type: boolean
+                  example: true
+      responses:
+        '200':
+          description: Proveedor actualizado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usuario'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+
+  /usuarios/me/entradas:
+    get:
+      tags: [Entradas]
+      summary: Entradas del cliente
+      description: Incluye el código QR de cada entrada. **Rol:** cliente.
+      operationId: listarMisEntradas
+      parameters:
+        - name: estado
+          in: query
+          schema:
+            $ref: '#/components/schemas/EstadoEntrada'
+      responses:
+        '200':
+          description: Entradas
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Entrada'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+    post:
+      tags: [Entradas]
+      summary: Comprar una entrada
+      description: |
+        1. Reserva aforo en ms-espacios (síncrono, caduca a los 10 min).
+        2. Cobra el importe en la pasarela de pago; si falla, libera la reserva.
+        3. Guarda la entrada, genera el QR firmado y publica `usuarios.entrada.comprada`.
+
+        **Rol:** cliente.
+      operationId: comprarEntrada
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompraEntrada'
+            example:
+              evento_id: evento-belgium
+              tipo_pase: WEEKEND
+              token_pago: tok_1PzQx2Lk
+      responses:
+        '201':
+          description: Entrada comprada
+          headers:
+            Location:
+              schema:
+                type: string
+                example: /api/v1/usuarios/me/entradas/entrada-abc12345
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entrada'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '402':
+          description: Pago rechazado por la pasarela
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+        '409':
+          description: No queda cupo para ese tipo de entrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: ms-espacios o la pasarela de pago no están disponibles; se puede reintentar
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /usuarios/me/entradas/{entrada_id}:
+    parameters:
+      - $ref: '#/components/parameters/EntradaId'
+    get:
+      tags: [Entradas]
+      summary: Obtener una entrada propia
+      description: '**Rol:** cliente.'
+      operationId: obtenerMiEntrada
+      responses:
+        '200':
+          description: Entrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entrada'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+
+  /usuarios/me/entradas/{entrada_id}/cancelaciones:
+    parameters:
+      - $ref: '#/components/parameters/EntradaId'
+    post:
+      tags: [Entradas]
+      summary: Solicitar la cancelación de una entrada
+      description: La entrada pasa a CANCELACION_SOLICITADA hasta que la revise un administrador. **Rol:** cliente.
+      operationId: solicitarCancelacion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [motivo]
+              properties:
+                motivo:
+                  description: Por qué el cliente pide la cancelación; lo lee el administrador que la resuelve.
+                  type: string
+                  minLength: 5
+                  example: No puedo asistir por un viaje de trabajo
+      responses:
+        '201':
+          description: Solicitud registrada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entrada'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+        '409':
+          description: La entrada no está ACTIVA o el evento ya ha empezado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /entradas:
+    get:
+      tags: [Entradas]
+      summary: Listar entradas (administración)
+      description: Útil para revisar solicitudes de cancelación. **Rol:** admin.
+      operationId: listarEntradas
+      parameters:
+        - name: evento_id
+          in: query
+          schema:
+            type: string
+        - name: estado
+          in: query
+          schema:
+            $ref: '#/components/schemas/EstadoEntrada'
+        - $ref: '#/components/parameters/Limite'
+        - $ref: '#/components/parameters/Desplazamiento'
+      responses:
+        '200':
+          description: Entradas
+          headers:
+            X-Total-Count:
+              $ref: '#/components/headers/XTotalCount'
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Entrada'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+
+  /entradas/{entrada_id}:
+    parameters:
+      - $ref: '#/components/parameters/EntradaId'
+    patch:
+      tags: [Entradas]
+      summary: Resolver una solicitud de cancelación
+      description: |
+        CANCELACION_SOLICITADA → CANCELADA (se reembolsa y publica `usuarios.entrada.cancelada`)
+        o → ACTIVA (se rechaza la solicitud). **Rol:** admin.
+      operationId: resolverCancelacion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [estado]
+              properties:
+                estado:
+                  description: CANCELADA acepta la solicitud y reembolsa la entrada; ACTIVA la rechaza.
+                  type: string
+                  enum: [CANCELADA, ACTIVA]
+                  example: CANCELADA
+      responses:
+        '200':
+          description: Entrada actualizada
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entrada'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+        '409':
+          description: La entrada no tiene una solicitud de cancelación pendiente
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /entradas/validaciones:
+    post:
+      tags: [Entradas]
+      summary: Validar una entrada en el control de acceso
+      description: |
+        El staff escanea el QR; se comprueba la firma, el evento y el estado. Si es válida la
+        entrada pasa a USADA y se publica `usuarios.entrada.validada`. **Rol:** staff o admin.
+      operationId: validarEntrada
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [codigo_qr, evento_id]
+              properties:
+                codigo_qr:
+                  description: "Texto leído del QR de la entrada: SUBSONIC|<entrada_id>|<evento_id>|<firma HMAC>."
+                  type: string
+                  example: SUBSONIC|entrada-abc12345|evento-belgium|4f9a1c2b7d3e8f60a1b2c3d4e5f60718
+                evento_id:
+                  type: string
+                  description: Evento en cuya puerta se valida
+                  example: evento-belgium
+      responses:
+        '201':
+          description: Entrada válida; acceso permitido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Validacion'
+        '400':
+          description: QR ilegible o con firma no válida
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+        '409':
+          description: Entrada ya usada, cancelada o de otro evento; acceso denegado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /usuarios/me/favoritos:
+    get:
+      tags: [Favoritos]
+      summary: Artistas favoritos del cliente
+      description: '**Rol:** cliente.'
+      operationId: listarFavoritos
+      responses:
+        '200':
+          description: Favoritos
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Favorito'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+    post:
+      tags: [Favoritos]
+      summary: Añadir un artista a favoritos
+      description: Publica `usuarios.favorito.anadido`. **Rol:** cliente.
+      operationId: anadirFavorito
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [artista_id]
+              properties:
+                artista_id:
+                  description: Artista que se añade a favoritos (identificador de ms-escaleta).
+                  type: string
+                  format: uuid
+                  example: "22222222-2222-4222-8222-000000000001"
+      responses:
+        '201':
+          description: Favorito añadido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Favorito'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '403':
+          $ref: '#/components/responses/SinPermiso'
+        '409':
+          description: El artista ya está en favoritos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /usuarios/me/favoritos/{artista_id}:
+    parameters:
+      - name: artista_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags: [Favoritos]
+      summary: Quitar un artista de favoritos
+      description: Publica `usuarios.favorito.eliminado`. **Rol:** cliente.
+      operationId: quitarFavorito
+      responses:
+        '204':
+          description: Favorito eliminado
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+        '404':
+          $ref: '#/components/responses/NoEncontrado'
+
+  /usuarios/me/preferencias-notificacion:
+    get:
+      tags: [Notificaciones]
+      summary: Obtener las preferencias de notificación
+      description: '**Rol:** autenticado.'
+      operationId: obtenerPreferencias
+      responses:
+        '200':
+          description: Preferencias
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreferenciasNotificacion'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+    put:
+      tags: [Notificaciones]
+      summary: Guardar las preferencias de notificación
+      description: '**Rol:** autenticado.'
+      operationId: guardarPreferencias
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PreferenciasNotificacion'
+      responses:
+        '200':
+          description: Preferencias guardadas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PreferenciasNotificacion'
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+
+  /usuarios/me/dispositivos:
+    post:
+      tags: [Notificaciones]
+      summary: Registrar un dispositivo para notificaciones push
+      description: Guarda el token de Firebase Cloud Messaging del dispositivo. **Rol:** autenticado.
+      operationId: registrarDispositivo
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fcm_token]
+              properties:
+                fcm_token:
+                  description: Token de Firebase Cloud Messaging del dispositivo, para enviarle notificaciones push.
+                  type: string
+                  example: dXp1c2hfdG9rZW5fZGVfZWplbXBsbw:APA91bH-ejemplo
+                plataforma:
+                  description: Sistema del dispositivo que se registra.
+                  type: string
+                  enum: [WEB, ANDROID, IOS]
+                  example: ANDROID
+      responses:
+        '201':
+          description: Dispositivo registrado
+        '400':
+          $ref: '#/components/responses/PeticionNoValida'
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+
+  /usuarios/me/dispositivos/{fcm_token}:
+    parameters:
+      - name: fcm_token
+        in: path
+        required: true
+        description: Token de Firebase Cloud Messaging del dispositivo, codificado para URL.
+        schema:
+          type: string
+          example: dXp1c2hfdG9rZW5fZGVfZWplbXBsbw:APA91bH-ejemplo
+    delete:
+      tags: [Notificaciones]
+      summary: Dar de baja un dispositivo
+      description: |
+        Borra el token para que el dispositivo deje de recibir notificaciones push, por ejemplo
+        al cerrar sesión. Si el token no estaba registrado también responde `204`. **Rol:** autenticado.
+      operationId: eliminarDispositivo
+      responses:
+        '204':
+          description: Dispositivo dado de baja
+        '401':
+          $ref: '#/components/responses/NoAutenticado'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Token de Firebase Authentication. El rol va en el custom claim `rol`.
+
+  parameters:
+    UsuarioId:
+      name: usuario_id
+      in: path
+      required: true
+      description: UID de Firebase
+      schema:
+        type: string
+    EntradaId:
+      name: entrada_id
+      in: path
+      required: true
+      schema:
+        type: string
+        example: entrada-abc12345
+    Limite:
+      name: limite
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Desplazamiento:
+      name: desplazamiento
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+
+  headers:
+    XTotalCount:
+      description: Número total de resultados sin paginar
+      schema:
+        type: integer
+
+  responses:
+    PeticionNoValida:
+      description: Datos de entrada no válidos
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NoAutenticado:
+      description: Falta el token o no es válido
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    SinPermiso:
+      description: El rol del usuario no permite esta operación
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NoEncontrado:
+      description: El recurso no existe
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [codigo, mensaje]
+      properties:
+        codigo:
+          description: Código del error, estable y en mayúsculas, para que el cliente lo trate sin leer el mensaje.
+          type: string
+          example: PAGO_RECHAZADO
+        mensaje:
+          description: Explicación del error para mostrar al usuario.
+          type: string
+          example: La pasarela de pago ha rechazado la tarjeta
+        detalles:
+          description: Información adicional, por ejemplo los campos no válidos.
+          type: object
+          additionalProperties: true
+          example: {campo: telefono, motivo: formato no válido}
+        correlation_id:
+          description: Identificador de la petición, el mismo en los logs de todos los servicios que intervienen.
+          type: string
+          format: uuid
+          example: 9b2f6c1e-3d4a-4b5c-8d7e-1f2a3b4c5d6e
+
+    Rol:
+      description: Rol del usuario. Determina qué operaciones puede hacer y va en el claim rol del token de Firebase.
+      type: string
+      enum: [CLIENTE, PROVEEDOR, ADMIN, STAFF]
+
+    DatosProveedor:
+      type: object
+      properties:
+        nombre_comercial:
+          description: Nombre con el que el proveedor aparece en el festival.
+          type: string
+          example: Frituras Boom S.L.
+        cif:
+          description: CIF o NIF de la empresa.
+          type: string
+          example: B12345678
+        tipo_servicio:
+          description: Categoría del servicio que ofrece (comida, bebida, merchandising…).
+          type: string
+          example: Comida
+        descripcion_servicio:
+          description: Descripción del servicio para los administradores que validan al proveedor.
+          type: string
+          example: Hamburguesas y patatas fritas, con opciones veganas.
+        validado:
+          description: Si un administrador ha validado al proveedor. Solo los validados pueden alquilar espacios.
+          type: boolean
+          readOnly: true
+          example: true
+
+    Usuario:
+      type: object
+      required: [id, email, rol, activo]
+      properties:
+        id:
+          type: string
+          description: UID de Firebase
+          example: uid-cliente-david
+        email:
+          description: Email de la cuenta, el mismo que en Firebase Authentication.
+          type: string
+          format: email
+          example: david.garcia@example.com
+        nombre:
+          description: Nombre.
+          type: string
+          example: David
+        apellidos:
+          description: Apellidos.
+          type: string
+          example: García López
+        telefono:
+          description: Teléfono de contacto.
+          type: string
+          example: +34 600 000 000
+        direccion:
+          description: Dirección postal.
+          type: string
+          example: Calle Mayor 12, 2.º B, 10003 Cáceres
+        rol:
+          $ref: '#/components/schemas/Rol'
+        activo:
+          description: Si la cuenta está activa (false si se ha desactivado).
+          type: boolean
+          example: true
+        creado_en:
+          description: Fecha de registro.
+          type: string
+          format: date-time
+          example: "2026-03-02T10:15:00Z"
+        proveedor:
+          allOf:
+            - $ref: '#/components/schemas/DatosProveedor'
+          nullable: true
+          description: Solo si el rol es PROVEEDOR
+          example: {nombre_comercial: Frituras Boom S.L., cif: B12345678, tipo_servicio: Comida, validado: true}
+
+    RegistroEntrada:
+      type: object
+      required: [nombre, rol]
+      properties:
+        nombre:
+          description: Nombre.
+          type: string
+          example: David
+        apellidos:
+          description: Apellidos.
+          type: string
+          example: García López
+        telefono:
+          description: Teléfono de contacto.
+          type: string
+          example: +34 600 000 000
+        direccion:
+          description: Dirección postal.
+          type: string
+          example: Calle Mayor 12, 2.º B, 10003 Cáceres
+        rol:
+          description: Rol con el que se registra. ADMIN y STAFF solo los asigna un administrador.
+          type: string
+          enum: [CLIENTE, PROVEEDOR]
+          example: CLIENTE
+        proveedor:
+          $ref: '#/components/schemas/DatosProveedor'
+
+    PerfilCambio:
+      type: object
+      minProperties: 1
+      properties:
+        nombre:
+          description: Nuevo nombre.
+          type: string
+          example: David
+        apellidos:
+          description: Nuevos apellidos.
+          type: string
+          example: García López
+        telefono:
+          description: Nuevo teléfono.
+          type: string
+          example: +34 611 111 111
+        direccion:
+          description: Nueva dirección postal.
+          type: string
+          example: Avenida de España 5, 10002 Cáceres
+        activo:
+          type: boolean
+          description: false para desactivar la cuenta
+          example: false
+        proveedor:
+          $ref: '#/components/schemas/DatosProveedor'
+
+    TipoPase:
+      description: "Tipo de pase: un día (DAY), fin de semana completo (WEEKEND) o VIP."
+      type: string
+      enum: [DAY, WEEKEND, VIP]
+
+    EstadoEntrada:
+      description: Estado de la entrada. Las transiciones están en la descripción del servicio.
+      type: string
+      enum: [ACTIVA, CANCELACION_SOLICITADA, CANCELADA, USADA]
+
+    CompraEntrada:
+      type: object
+      required: [evento_id, tipo_pase, token_pago]
+      properties:
+        evento_id:
+          description: Evento para el que se compra la entrada.
+          type: string
+          example: evento-belgium
+        tipo_pase:
+          $ref: '#/components/schemas/TipoPase'
+        token_pago:
+          type: string
+          description: Token de la tarjeta generado por el SDK de la pasarela en el front-end (nunca los datos de la tarjeta)
+          example: tok_1PzQx2Lk
+
+    Entrada:
+      type: object
+      properties:
+        id:
+          description: Identificador de la entrada.
+          type: string
+          example: entrada-abc12345
+        evento_id:
+          description: Evento de la entrada.
+          type: string
+          example: evento-belgium
+        evento_titulo:
+          description: Nombre del evento en el momento de la compra, para mostrarlo sin consultar ms-espacios.
+          type: string
+          example: Subsonic Belgium
+        evento_fechas:
+          description: Fechas del evento en texto, para mostrarlas en la entrada.
+          type: string
+          example: 18 – 27 Julio 2026
+        tipo_pase:
+          $ref: '#/components/schemas/TipoPase'
+        precio_pagado:
+          description: Precio cobrado en euros.
+          type: number
+          format: float
+          example: 199
+        estado:
+          $ref: '#/components/schemas/EstadoEntrada'
+        codigo_qr:
+          type: string
+          description: Contenido del QR firmado (HMAC), verificable sin conexión
+          example: SUBSONIC|entrada-abc12345|evento-belgium|4f9a1c2b7d3e8f60a1b2c3d4e5f60718
+        motivo_cancelacion:
+          description: Motivo que dio el cliente al pedir la cancelación; null si no la ha pedido.
+          type: string
+          nullable: true
+        comprada_en:
+          description: Fecha y hora de la compra.
+          type: string
+          format: date-time
+          example: "2026-05-20T17:42:00Z"
+        usada_en:
+          description: Fecha y hora en que se validó en la puerta; null si no se ha usado.
+          type: string
+          format: date-time
+          nullable: true
+          example: "2026-07-18T16:05:00Z"
+
+    Validacion:
+      type: object
+      properties:
+        entrada_id:
+          description: Entrada validada.
+          type: string
+          example: entrada-abc12345
+        tipo_pase:
+          $ref: '#/components/schemas/TipoPase'
+        titular:
+          description: Nombre completo del titular, para que el staff lo compare con su documento.
+          type: string
+          example: Paula Jiménez Cruz
+        validada_en:
+          description: Fecha y hora de la validación.
+          type: string
+          format: date-time
+          example: "2026-07-18T16:05:00Z"
+
+    Favorito:
+      type: object
+      properties:
+        artista_id:
+          description: Artista favorito (identificador de ms-escaleta).
+          type: string
+          format: uuid
+          example: "22222222-2222-4222-8222-000000000001"
+        artista_nombre:
+          description: Nombre del artista, para mostrarlo sin consultar ms-escaleta.
+          type: string
+          example: Armin van Buuren
+        creado_en:
+          description: Cuándo se añadió a favoritos.
+          type: string
+          format: date-time
+          example: "2026-04-11T09:30:00Z"
+
+    PreferenciasNotificacion:
+      type: object
+      required: [push, email]
+      properties:
+        push:
+          description: Si quiere recibir notificaciones push (cambios de horario de sus artistas favoritos, avisos de pedidos…).
+          type: boolean
+          example: true
+        email:
+          description: Si quiere recibir emails (confirmaciones de compra, cancelaciones…).
+          type: boolean
+          example: true
