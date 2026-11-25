@@ -38,7 +38,6 @@ jobs:
           branch = True
           omit =
               tests/*
-              migrations/*
           EOF
           python -m pytest -q --cov --cov-config="$coverage_config" --cov-report=term --cov-report=xml:coverage.xml
       - name: Analizar en SonarQube Cloud
