@@ -11,14 +11,32 @@ from firebase_admin import auth  # noqa: E402
 from service.firebase_auth import _firebase  # noqa: E402
 
 
+API_URL_PREDETERMINADA = "http://localhost:8003"
+
+
 def comprobar(api_url: str) -> None:
+    origen = api_url.removesuffix("/")
+    if origen in (API_URL_PREDETERMINADA, "http://127.0.0.1:8003"):
+        base_url = "http://127.0.0.1:8003"
+    elif origen == "http://[::1]:8003":
+        base_url = "http://[::1]:8003"
+    else:
+        raise SystemExit(
+            "--api-url debe ser un origen HTTP local (localhost, 127.0.0.1 o [::1]) en el puerto 8003."
+        )
+
     app = _firebase()
     if app is None:
         raise SystemExit("Configura FIREBASE_CREDENCIALES; esta prueba no admite el modo simulado.")
     uid = f"prueba-usuarios-{uuid4().hex}"
     email = f"{uid}@example.invalid"
-    with httpx.Client(base_url=api_url.rstrip("/"), timeout=15,
-                      headers={"X-User-Id": uid, "X-User-Email": email}) as cliente:
+    with httpx.Client(
+        base_url=base_url,
+        timeout=15,
+        follow_redirects=False,
+        trust_env=False,
+        headers={"X-User-Id": uid, "X-User-Email": email},
+    ) as cliente:
         # Si la creación falla, no se intenta borrar ningún UID que pudiera ser ajeno.
         auth.create_user(uid=uid, email=email, disabled=True, app=app)
         eliminado = False
@@ -54,5 +72,5 @@ def comprobar(api_url: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--api-url", default="http://localhost:8003")
+    parser.add_argument("--api-url", default=API_URL_PREDETERMINADA, help="Origen HTTP local en el puerto 8003")
     comprobar(parser.parse_args().api_url)
