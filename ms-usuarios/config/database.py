@@ -2,14 +2,14 @@
 # Conexión a PostgreSQL (usuarios_db) mediante SQLAlchemy
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from config.settings import DATABASE_URL
 from alembic import command
 from alembic.config import Config
-from config.settings import BASE_DIR
+from config.settings import BASE_DIR, obtener_url_bd
 
 # SQLite solo se usa en los tests (sin Docker); en local y en contenedor es PostgreSQL
-_connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=_connect_args)
+_database_url = obtener_url_bd()
+_connect_args = {"check_same_thread": False} if _database_url.startswith("sqlite") else {}
+engine = create_engine(_database_url, pool_pre_ping=True, connect_args=_connect_args)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 

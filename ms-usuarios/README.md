@@ -46,10 +46,13 @@ docker compose up -d usuarios-db      # solo la base de datos
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1          # Mac/Linux: source .venv/bin/activate
 pip install -r requirements.txt
-copy .env.example .env                # Mac/Linux: cp .env.example .env
+# Configura DATABASE_URL en .env o en el entorno de Python.
 python scripts/poblar_bd.py
 python main.py
 ```
+
+`DATABASE_URL` debe apuntar a la base de datos de usuarios con las credenciales
+locales. Compose la proporciona al contenedor en el entorno del servicio.
 
 ## Tests
 
@@ -133,7 +136,7 @@ Se necesita el JSON de la cuenta de servicio del monolito. Se comparte **fuera d
 no se incluye en la imagen Docker. `.gitignore` y `.dockerignore` excluyen `.env`,
 `firebase-claves.json` y `secrets/`.
 
-Para Python local, copia `.env.example` a `.env` y configura una ruta absoluta:
+Para Python local, añade la variable en `.env` con una ruta absoluta:
 
 ```dotenv
 FIREBASE_CREDENCIALES=C:/ruta/privada/firebase-claves.json

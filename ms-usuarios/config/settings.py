@@ -10,10 +10,6 @@ load_dotenv(dotenv_path=BASE_DIR / ".env")
 NOMBRE_SERVICIO = "ms-usuarios"
 PREFIJO_API = "/api/v1"
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+psycopg://usuarios:usuarios@localhost:5433/usuarios_db",
-)
 PUERTO = int(os.getenv("PUERTO", "8003"))
 
 # Otros microservicios
@@ -28,3 +24,10 @@ QR_SECRETO = os.getenv("QR_SECRETO", "secreto-qr-dev")
 
 # Ruta al JSON de la cuenta de servicio de Firebase. Vacío = Firebase simulado (solo log)
 FIREBASE_CREDENCIALES = os.getenv("FIREBASE_CREDENCIALES", "")
+
+
+def obtener_url_bd() -> str:
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise RuntimeError("Configura DATABASE_URL en el entorno o en el archivo .env de ms-usuarios")
+    return url
