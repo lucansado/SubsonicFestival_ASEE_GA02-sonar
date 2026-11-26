@@ -38,6 +38,14 @@ El contenedor usa `rabbitmq:5672`; para ejecutar Python en el equipo se usa `loc
 El archivo `.env` también lo lee Compose: si has configurado allí la URL local, cámbiala al nombre
 `rabbitmq` antes de levantar el contenedor. Sin credenciales, Firebase permanece simulado.
 
+La imagen instala las versiones y los hashes de `requirements.lock.txt`. Al cambiar
+`requirements.txt`, regenera el archivo de bloqueo para Python 3.12 en Linux desde `ms-usuarios`:
+
+```bash
+uv pip compile --no-config --default-index https://pypi.org/simple --generate-hashes \
+  --python-version 3.12 --python-platform linux --output-file requirements.lock.txt requirements.txt
+```
+
 ## Desarrollar en local (con recarga automática)
 
 ```bash
