@@ -8,7 +8,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY main.py alembic.ini openapi.yaml ./
+COPY config/ config/
+COPY controller/ controller/
+COPY eventos/ eventos/
+COPY migrations/ migrations/
+COPY model/ model/
+COPY scripts/ scripts/
+COPY service/ service/
 
 EXPOSE 8003
 
