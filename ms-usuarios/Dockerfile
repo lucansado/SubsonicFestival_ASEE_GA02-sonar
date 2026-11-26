@@ -12,4 +12,8 @@ COPY . .
 
 EXPOSE 8003
 
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --create-home --shell /usr/sbin/nologin app
+USER app:app
+
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
